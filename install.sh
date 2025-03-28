@@ -54,21 +54,45 @@ print_error() {
 # Clear screen and show header
 clear
 echo -e "${BLUE}"
-print_centered "╔═══════════════════════════════════════════════╗"
-print_centered "║             CLPDash Installation             ║"
-print_centered "║           Security Configuration             ║"
-print_centered "╚═══════════════════════════════════════════════╝"
-echo -e "${NC}"
+echo "                                         ╔═══════════════════════════════════════════════╗"
+echo "                                         ║             CLPDash Installation             ║"
+echo "                                         ║           Security Configuration             ║"
+echo "                                         ╚═══════════════════════════════════════════════╝"
+echo -e "${NC}\n"
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then 
-    print_error "Please run as root"
+    print_error "Please run as root (sudo ./install.sh)"
     exit 1
 fi
 
-# System requirements check
-echo -e "\n${BOLD}Checking system requirements...${NC}"
-sleep 1
+# Function to wait for apt to be available
+wait_for_apt() {
+    while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+        print_warning "Waiting for other package managers to finish..."
+        sleep 1
+    done
+}
+
+# Install system dependencies
+print_status "Installing system dependencies..."
+wait_for_apt
+apt-get update
+apt-get install -y curl git openssh-server build-essential
+
+# Install Node.js
+print_status "Installing Node.js..."
+if ! command -v node &> /dev/null; then
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+    wait_for_apt
+    apt-get install -y nodejs
+fi
+
+# Install pnpm
+print_status "Installing pnpm..."
+if ! command -v pnpm &> /dev/null; then
+    npm install -g pnpm
+fi
 
 # Create installation directory
 INSTALL_DIR="/opt/clpdash"
@@ -76,144 +100,75 @@ print_status "Creating installation directory at ${INSTALL_DIR}"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR" || exit 1
 
-# Install system dependencies
-print_status "Installing system dependencies..."
-if command -v apt-get &> /dev/null; then
-    # Debian/Ubuntu
-    apt-get update
-    apt-get install -y curl git openssh-server
-elif command -v yum &> /dev/null; then
-    # CentOS/RHEL
-    yum update -y
-    yum install -y curl git openssh-server
-else
-    print_error "Unsupported package manager. Please install dependencies manually."
-    exit 1
-fi
-
-# Install Node.js using nvm
-print_status "Installing Node.js..."
-if ! command -v node &> /dev/null; then
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
-    export NVM_DIR="$HOME/.nvm"
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-    nvm install 18
-    nvm use 18
-fi
-
-# Install pnpm
-print_status "Installing pnpm..."
-if ! command -v pnpm &> /dev/null; then
-    curl -fsSL https://get.pnpm.io/install.sh | sh -
-    source ~/.bashrc
-fi
-
-# Clone repository
+# Clone repository using HTTPS
 print_status "Cloning repository..."
 if [ ! -d "$INSTALL_DIR/.git" ]; then
-    git clone https://github.com/yourusername/clpdash.git .
+    print_warning "Please enter your GitHub Personal Access Token:"
+    read -r github_token
+    git clone https://oauth2:${github_token}@github.com/HaCkEerDG/CLPDash.git .
 else
     git pull
 fi
 
-# Install project dependencies
+# Set permissions
+chown -R $SUDO_USER:$SUDO_USER "$INSTALL_DIR"
+
+# Switch to the user who ran sudo
+su - $SUDO_USER << 'EOF'
+cd "$INSTALL_DIR"
+
+# Install dependencies
 print_status "Installing project dependencies..."
 pnpm install
 
 # Create .env.local if it doesn't exist
 if [ ! -f .env.local ]; then
     print_status "Creating .env.local file..."
-    cat > .env.local << EOL
+    cat > .env.local << EOFENV
 NEXTAUTH_URL=http://localhost:6152
 NEXTAUTH_SECRET=$(openssl rand -base64 32)
 
 # SSH Configuration
 SSH_HOST=localhost
 SSH_PORT=22
-SSH_USER=$SUDO_USER
+SSH_USER=$USER
 SSH_PASSWORD=
 # SSH_KEY=
-
-# Optional Configuration
-ENABLE_HTTPS=false
-RATE_LIMIT=100
-SESSION_TIMEOUT=3600
-EOL
-    print_warning "Please update SSH credentials in .env.local"
+EOFENV
 fi
 
 # Build the application
 print_status "Building the application..."
 pnpm build
+EOF
 
-# Install and configure PM2
-print_status "Setting up PM2..."
-if ! command -v pm2 &> /dev/null; then
-    npm install -g pm2
-fi
-
-# Create PM2 ecosystem file
-cat > ecosystem.config.js << EOL
-module.exports = {
-  apps: [{
-    name: 'clpdash',
-    script: 'pnpm',
-    args: 'start',
-    env: {
-      NODE_ENV: 'production',
-      PORT: 6152
-    },
-    max_memory_restart: '300M'
-  }]
-}
-EOL
-
-# Setup systemd service
+# Create systemd service
 print_status "Creating systemd service..."
 cat > /etc/systemd/system/clpdash.service << EOL
 [Unit]
-Description=ClpDash Server Management Dashboard
+Description=CLPDash Server Management Dashboard
 After=network.target
 
 [Service]
-Type=forking
+Type=simple
 User=$SUDO_USER
 WorkingDirectory=$INSTALL_DIR
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=PM2_HOME=$INSTALL_DIR/.pm2
-ExecStart=/usr/local/bin/pm2 start ecosystem.config.js
-ExecReload=/usr/local/bin/pm2 reload ecosystem.config.js
-ExecStop=/usr/local/bin/pm2 stop ecosystem.config.js
+ExecStart=$(which pnpm) start
+Restart=always
 
 [Install]
 WantedBy=multi-user.target
 EOL
 
-# Set permissions
-print_status "Setting permissions..."
-chown -R "$SUDO_USER:$SUDO_USER" "$INSTALL_DIR"
-chmod -R 755 "$INSTALL_DIR"
-
-# Start the service
-print_status "Starting ClpDash service..."
+# Configure permissions
+print_status "Configuring permissions..."
 systemctl daemon-reload
 systemctl enable clpdash
 systemctl start clpdash
 
-# Configure sudoers for service management
-print_status "Configuring sudo permissions..."
-cat > /etc/sudoers.d/clpdash << EOL
-$SUDO_USER ALL=(ALL) NOPASSWD: /bin/systemctl status *
-$SUDO_USER ALL=(ALL) NOPASSWD: /bin/systemctl start *
-$SUDO_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop *
-$SUDO_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart *
-EOL
-chmod 440 /etc/sudoers.d/clpdash
-
 print_status "Installation complete!"
-echo -e "${GREEN}ClpDash is now running at http://localhost:6152${NC}"
+echo -e "${GREEN}CLPDash is now running at http://localhost:6152${NC}"
 echo -e "${YELLOW}Please update your SSH credentials in $INSTALL_DIR/.env.local${NC}"
-echo -e "${YELLOW}For security, consider setting up HTTPS and updating the admin password${NC}"
 
 # Display completion message
 echo -e "\n${GREEN}${BOLD}Installation completed successfully!${NC}"

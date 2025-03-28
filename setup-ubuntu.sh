@@ -19,6 +19,13 @@ sudo npm install -g pnpm
 
 # Install dependencies
 echo -e "${YELLOW}Installing project dependencies...${NC}"
+
+# Clone repository if not already cloned
+if [ ! -d "CLPDash" ]; then
+    git clone https://github.com/HaCkEerDG/CLPDash.git
+    cd CLPDash
+fi
+
 pnpm install
 
 # Create .env.local if it doesn't exist
